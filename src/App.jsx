@@ -13,9 +13,22 @@ import { Journal } from './components/tabs/Journal';
 import { OnboardingModal } from './components/modals/OnboardingModal';
 import { SettingsModal } from './components/modals/SettingsModal';
 import { LeadModal } from './components/modals/LeadModal';
+import { AuthOverlay } from './components/auth/AuthOverlay';
 
 function App() {
-  const { activeTab } = useAppContext();
+  const { activeTab, session, loading } = useAppContext();
+
+  if (loading) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', backgroundColor: 'var(--bg-color)', color: 'var(--text-main)' }}>
+        <p>Loading your journey...</p>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <AuthOverlay onAuthSuccess={() => { }} />;
+  }
 
   return (
     <>

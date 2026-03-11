@@ -1,4 +1,5 @@
-import { createContext, useContext, useState, useEffect } from 'react';
+import { createContext, useContext, useState, useEffect, useRef } from 'react';
+import { supabase } from './supabase';
 
 const STAGES_DATA = [
   {
@@ -106,64 +107,81 @@ const defaultState = {
 const AppContext = createContext();
 
 export const AppProvider = ({ children }) => {
-  const [state, setState] = useState(() => {
-    const saved = localStorage.getItem('designerRoadmap');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return {
-          ...defaultState,
-          ...parsed,
-          settings: { ...defaultState.settings, ...(parsed.settings || {}) },
-          stages: { ...defaultState.stages, ...(parsed.stages || {}) },
-          daily: { ...defaultState.daily, ...(parsed.daily || {}) }
-        };
-      } catch (e) {
-        return defaultState;
-      }
-    }
-    return defaultState;
-  });
+  const [session, setSession] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [state, setState] = useState(defaultState);
 
   const [activeTab, setActiveTab] = useState('dashboard');
   const [activeModal, setActiveModal] = useState(null);
 
-  // Save to localStorage on state change
+  const debounceTimer = useRef(null);
+
   useEffect(() => {
-    localStorage.setItem('designerRoadmap', JSON.stringify(state));
-    // Apply theme
-    if (state.settings.darkMode) {
-      document.body.setAttribute('data-theme', 'dark');
-    } else {
-      document.body.removeAttribute('data-theme');
-    }
-  }, [state]);
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      if (session) fetchInitialData(session.user.id);
+      else setLoading(false);
+    });
 
-  // Initial setup per day
-  useEffect(() => {
-    const today = getToday();
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+      if (session) {
+        setLoading(true);
+        fetchInitialData(session.user.id);
+      } else {
+        setState(defaultState);
+        setLoading(false);
+      }
+    });
 
-    setState(prev => {
-      const newState = { ...prev, progress: { ...prev.progress }, daily: { ...prev.daily } };
+    return () => subscription.unsubscribe();
+  }, []);
 
-      if (prev.progress.lastActiveDate !== today) {
-        if (prev.progress.lastActiveDate) {
+  const fetchInitialData = async (userId) => {
+    try {
+      const [profileRes, leadsRes, journalRes] = await Promise.all([
+        supabase.from('user_profiles').select('*').eq('id', userId).single(),
+        supabase.from('leads').select('*').eq('user_id', userId),
+        supabase.from('journals').select('*').eq('user_id', userId)
+      ]);
+
+      if (profileRes.error && profileRes.error.code !== 'PGRST116') throw profileRes.error;
+
+      let newState = { ...defaultState };
+
+      if (profileRes.data) {
+        const p = profileRes.data;
+        newState = {
+          user: { name: p.name || "", onboarded: p.onboarded || false },
+          settings: { revenueGoal: p.revenue_goal || 50000, darkMode: p.dark_mode || false },
+          progress: { currentStage: p.current_stage || 1, streak: p.streak || 0, lastActiveDate: p.last_active_date || "" },
+          stages: Object.keys(p.stages_data).length > 0 ? p.stages_data : defaultStages,
+          daily: p.daily_data?.date ? p.daily_data : { date: "", tasks: [], history: {} },
+          leads: leadsRes.data || [],
+          journal: journalRes.data || []
+        };
+      }
+
+      // Check daily logic
+      const today = getToday();
+      if (newState.progress.lastActiveDate !== today) {
+        if (newState.progress.lastActiveDate) {
           const yesterday = new Date();
           yesterday.setDate(yesterday.getDate() - 1);
           const yStr = yesterday.toISOString().split('T')[0];
 
-          if (prev.progress.lastActiveDate === yStr) {
-            const completedCount = prev.daily.tasks.filter(t => t.completed).length;
+          if (newState.progress.lastActiveDate === yStr) {
+            const completedCount = newState.daily.tasks.filter(t => t.completed).length;
             if (completedCount > 0) newState.progress.streak++;
           } else {
             newState.progress.streak = 0;
           }
 
-          if (prev.daily.tasks.length > 0) {
-            const completed = prev.daily.tasks.filter(t => t.completed).length;
+          if (newState.daily.tasks.length > 0) {
+            const completed = newState.daily.tasks.filter(t => t.completed).length;
             newState.daily.history = {
-              ...prev.daily.history,
-              [prev.daily.date]: { completed, total: prev.daily.tasks.length }
+              ...newState.daily.history,
+              [newState.daily.date]: { completed, total: newState.daily.tasks.length }
             };
           }
         }
@@ -171,7 +189,6 @@ export const AppProvider = ({ children }) => {
         newState.progress.lastActiveDate = today;
         newState.daily.date = today;
 
-        // Generate new tasks
         const pool = TASK_POOL[newState.progress.currentStage] || TASK_POOL[1];
         const shuffled = [...pool].sort(() => 0.5 - Math.random());
         newState.daily.tasks = shuffled.slice(0, 3).map(text => ({
@@ -180,8 +197,7 @@ export const AppProvider = ({ children }) => {
           completed: false,
           type: 'generated'
         }));
-      } else if (prev.daily.tasks.length === 0) {
-        // Same day but no tasks exist
+      } else if (newState.daily.tasks.length === 0) {
         const pool = TASK_POOL[newState.progress.currentStage] || TASK_POOL[1];
         const shuffled = [...pool].sort(() => 0.5 - Math.random());
         newState.daily.tasks = shuffled.slice(0, 3).map(text => ({
@@ -192,15 +208,79 @@ export const AppProvider = ({ children }) => {
         }));
       }
 
-      return newState;
-    });
+      setState(newState);
+    } catch (error) {
+      console.error('Error fetching data:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-  }, []);
+  const syncToSupabase = async (currentState) => {
+    if (!session?.user?.id) return;
+    const userId = session.user.id;
+
+    try {
+      // Upsert profile
+      await supabase.from('user_profiles').upsert({
+        id: userId,
+        name: currentState.user.name,
+        onboarded: currentState.user.onboarded,
+        revenue_goal: currentState.settings.revenueGoal,
+        dark_mode: currentState.settings.darkMode,
+        current_stage: currentState.progress.currentStage,
+        streak: currentState.progress.streak,
+        last_active_date: currentState.progress.lastActiveDate,
+        stages_data: currentState.stages,
+        daily_data: currentState.daily
+      });
+
+      // Upsert leads
+      if (currentState.leads.length > 0) {
+        const mappedLeads = currentState.leads.map(l => ({
+          ...l,
+          user_id: userId,
+          date_added: l.dateAdded || l.date_added,
+          date_updated: l.dateUpdated || l.date_updated,
+        }));
+        // Remove old camelCase keys just in case but Supabase ignores them if not in schema usually
+        await supabase.from('leads').upsert(mappedLeads.map(({ dateAdded, dateUpdated, ...rest }) => rest));
+      }
+
+      // Upsert journals
+      if (currentState.journal.length > 0) {
+        const mappedJournals = currentState.journal.map(j => ({
+          ...j,
+          user_id: userId
+        }));
+        await supabase.from('journals').upsert(mappedJournals);
+      }
+    } catch (e) {
+      console.error("Failed to sync to Supabase", e);
+    }
+  };
+
+  // Apply theme dynamically
+  useEffect(() => {
+    if (state.settings.darkMode) {
+      document.body.setAttribute('data-theme', 'dark');
+    } else {
+      document.body.removeAttribute('data-theme');
+    }
+  }, [state.settings.darkMode]);
 
   const updateState = (updater) => {
     setState(prev => {
       const partialState = typeof updater === 'function' ? updater(prev) : updater;
-      return { ...prev, ...partialState };
+      const newState = { ...prev, ...partialState };
+
+      // Debounce the sync so we don't spam the database on every keystroke
+      if (debounceTimer.current) clearTimeout(debounceTimer.current);
+      debounceTimer.current = setTimeout(() => {
+        syncToSupabase(newState);
+      }, 1000);
+
+      return newState;
     });
   };
 
@@ -209,6 +289,8 @@ export const AppProvider = ({ children }) => {
 
   return (
     <AppContext.Provider value={{
+      session,
+      loading,
       state,
       updateState,
       activeTab,

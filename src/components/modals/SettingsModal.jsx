@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X } from 'lucide-react';
+import { supabase } from '../../supabase';
 import { useAppContext } from '../../store';
 import { Button } from '../ui/Button';
 import { Toggle } from '../ui/Toggle';
@@ -80,6 +81,18 @@ export const SettingsModal = () => {
                     <Button onClick={exportData}>Export JSON</Button>
                     <Button onClick={() => document.getElementById('importFile').click()}>Import JSON</Button>
                     <input type="file" id="importFile" style={{ display: 'none' }} accept=".json" onChange={importData} />
+                </div>
+
+                <div className="mt-4 pt-4 text-center" style={{ borderTop: '1px solid var(--border-color)' }}>
+                    <Button
+                        style={{ width: '100%', borderColor: 'var(--accent-color)', color: 'var(--accent-color)' }}
+                        onClick={async () => {
+                            await supabase.auth.signOut();
+                            closeModal();
+                        }}
+                    >
+                        Sign Out
+                    </Button>
                 </div>
 
                 <Button variant="primary" className="mt-4 w-full" onClick={handleSave}>
